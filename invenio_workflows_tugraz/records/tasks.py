@@ -11,58 +11,82 @@
 from celery import shared_task
 from flask import current_app
 
-from invenio_access.permissions import system_identity
+from datacite.errors import DataCiteNotFoundError
 from invenio_jobs.errors import TaskExecutionPartialError
-from repository_cli.utils import get_records_service
+from invenio_rdm_records.records.api import RDMRecord
+from invenio_rdm_records.services.pids.providers import DataCiteClient
+from invenio_records_lom.records.api import LOMRecord
+from invenio_records_marc21.records.api import Marc21Record
+
+
 
 @shared_task(ignore_result=True)
 def validate_records_dois():
     current_app.logger.info("Starting DOI validation for all records...")
 
-    services = ["marc21", "lom", "rdm"]  # List of services to validate
+    client = DataCiteClient("datacite") # -> DataCiteRESTClient
+
+    record_apis = {
+        "marc21": Marc21Record,
+        "lom": LOMRecord,
+        "rdm": RDMRecord,
+    }
+
+    http_folder = {
+        "marc21": "publications",
+        "lom": "oer",
+        "rdm": "records",
+    }
+
+
     nr_total_invalid_dois = 0  # Total number of invalid DOIs across all services
-    for service in services:
-        records_service = get_records_service(service)
-        records = records_service.read_all(identity=system_identity, fields=None)
-        
-        current_app.logger.debug(f"Found {len(records)} {service.upper()} records to validate.")
+    for api in record_apis:
+        record_api = record_apis.get(api)
+
+        records = record_api.model_cls.query.all()
+        current_app.logger.debug(f"Found {len(records)} {api.upper()} records to validate.")
 
         recs_without_doi = 0
         recs_with_doi = 0
-        nr_valid_dois = 0
         invalid_dois = []  # List to store invalid DOIs
 
         for record in records:
-            record_id = record.get('id', None)
-            current_app.logger.debug(f"Validating DOI for {service.upper()} record ID: {record_id}")
+            record_id = record.data.get('id', None)
+            current_app.logger.debug(f"Validating DOI for {api.upper()} record ID: {record_id}")
 
-            ids = record.get("metadata", {}).get("identifiers", [])
-            if ids == None or len(ids) == 0:
-                current_app.logger.debug(f"{service.upper()} record ID {record_id} has no identifiers.")
+            record_doi = record.data.get("pids", {}).get("doi", {}).get("identifier", None)
+
+            if record_doi == None or record_doi == "":
+                current_app.logger.debug(f"{api.upper()} record ID {record_id} has no DOI.")
                 recs_without_doi += 1
                 continue
-
-            doi_valid = False
-            for id in ids:
-                if id.get("scheme") == "doi":
-                    # do DOI validation here
-                    # ... todo
-                    recs_with_doi += 1
-                    break
             
-            if doi_valid:
-                nr_valid_dois += 1
-            else:
+            recs_with_doi += 1
+            
+            try:
+                url_query = client.api.get_doi(record_doi) # get url DOI is pointing to
+            # except DataCiteNotFoundError:
+            #     current_app.logger.error(f"Test DOI {test_id} not found in DataCite.")
+            except Exception as e:
+                current_app.logger.warning(f"{api.upper()} record ID {record_id} with DOI {record_doi} returned an error when validating: {str(e)}")
                 invalid_dois.append(record_id)
-                current_app.logger.debug(f"{service.upper()} record ID {record_id} has an invalid DOI.")
+                continue
+
+            url_expected = f"https://{current_app.config['APP_HOST']}/{http_folder.get(api)}/{record_id}"
+            if url_query != url_expected:
+                current_app.logger.warning(f"{api.upper()} record ID {record_id} has DOI {record_doi} pointing to {url_query}, but expected {url_expected}.")
+                invalid_dois.append(record_id)
+
+
+
+
 
         nr_total_invalid_dois += len(invalid_dois)
         
-        current_app.logger.info(f"{service.upper()} records without DOIs: {recs_without_doi}")
-        current_app.logger.info(f"{service.upper()} records with DOIs: {recs_with_doi}")
-        current_app.logger.info(f"{service.upper()} records with valid DOIs: {nr_valid_dois}")
-        for rec in invalid_dois:
-            current_app.logger.warning(f"Invalid DOI found in {service.upper()} record ID: {rec}")
+        current_app.logger.info(f"{api.upper()} records without DOIs: {recs_without_doi}")
+        current_app.logger.info(f"{api.upper()} records with DOIs: {recs_with_doi}")
+        # for rec in invalid_dois:
+        #     current_app.logger.warning(f"Invalid DOI found in {api.upper()} record ID: {rec}")
 
     if nr_total_invalid_dois > 0:
         current_app.logger.warning(f"Total invalid DOIs found across all services: {nr_total_invalid_dois}")
