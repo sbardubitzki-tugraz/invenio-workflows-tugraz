@@ -26,68 +26,53 @@ def validate_records_dois():
 
     client = DataCiteClient("datacite") # -> DataCiteRESTClient
 
-    record_apis = {
-        "marc21": Marc21Record,
-        "lom": LOMRecord,
-        "rdm": RDMRecord,
+    record_types = {
+        "marc21": {"api": Marc21Record, "name" : "Publications" , "http_path": "publications"},
+        "lom": {"api": LOMRecord, "name": "Educational Resources", "http_path": "oer"},
+        "rdm": {"api": RDMRecord, "name": "Research Results", "http_path": "records"},
     }
 
-    http_folder = {
-        "marc21": "publications",
-        "lom": "oer",
-        "rdm": "records",
-    }
-
-
-    nr_total_invalid_dois = 0  # Total number of invalid DOIs across all services
-    for api in record_apis:
-        record_api = record_apis.get(api)
+    for record_type in record_types.values():
+        record_api = record_type.get("api")
 
         records = record_api.model_cls.query.all()
-        current_app.logger.debug(f"Found {len(records)} {api.upper()} records to validate.")
 
-        recs_without_doi = 0
-        recs_with_doi = 0
-        invalid_dois = []  # List to store invalid DOIs
+        record_type["all_records"] = len(records)
+        record_type["records_with_doi"] = 0
+        record_type["records_with_invalid_doi"] = 0
+        record_type["records_with_doi_query_errors"] = 0
 
         for record in records:
             record_id = record.data.get('id', None)
-            current_app.logger.debug(f"Validating DOI for {api.upper()} record ID: {record_id}")
-
             record_doi = record.data.get("pids", {}).get("doi", {}).get("identifier", None)
 
             if record_doi == None or record_doi == "":
-                current_app.logger.debug(f"{api.upper()} record ID {record_id} has no DOI.")
-                recs_without_doi += 1
+                current_app.logger.debug(f"{record_type.get('name')} record ID {record_id} has no DOI.")
                 continue
-            
-            recs_with_doi += 1
+                
+            record_type["records_with_doi"] += 1
             
             try:
-                url_query = client.api.get_doi(record_doi) # get url DOI is pointing to
-            # except DataCiteNotFoundError:
-            #     current_app.logger.error(f"Test DOI {test_id} not found in DataCite.")
+                url_query = client.api.get_doi(record_doi) 
             except Exception as e:
-                current_app.logger.warning(f"{api.upper()} record ID {record_id} with DOI {record_doi} returned an error when validating: {str(e)}")
-                invalid_dois.append(record_id)
+                current_app.logger.warning(f"{record_type.get('name')} record ID {record_id} with DOI {record_doi} returned an error when validating: {str(e)}")
+                record_type["records_with_doi_query_errors"] += 1
                 continue
 
-            url_expected = f"https://{current_app.config['APP_HOST']}/{http_folder.get(api)}/{record_id}"
+            url_expected = f"https://{current_app.config['APP_HOST']}/{record_type.get('http_path')}/{record_id}"
             if url_query != url_expected:
-                current_app.logger.warning(f"{api.upper()} record ID {record_id} has DOI {record_doi} pointing to {url_query}, but expected {url_expected}.")
-                invalid_dois.append(record_id)
+                current_app.logger.warning(f"{record_type.get('name')} record ID {record_id} has DOI {record_doi} pointing to {url_query}, but expected {url_expected}.")
+                record_type["records_with_invalid_doi"] += 1
 
 
+        # Log the results for the current record type
+        current_app.logger.info(f"{record_type.get('name')} records total: {record_type['all_records']}")        
+        current_app.logger.info(f"{record_type.get('name')} records with DOIs: {record_type['records_with_doi']}")
+        current_app.logger.info(f"{record_type.get('name')} records with invalid DOIs: {record_type['records_with_invalid_doi']}")
+        current_app.logger.info(f"{record_type.get('name')} records with DOI query errors: {record_type['records_with_doi_query_errors']}")
 
-
-
-        nr_total_invalid_dois += len(invalid_dois)
-        
-        current_app.logger.info(f"{api.upper()} records without DOIs: {recs_without_doi}")
-        current_app.logger.info(f"{api.upper()} records with DOIs: {recs_with_doi}")
-        # for rec in invalid_dois:
-        #     current_app.logger.warning(f"Invalid DOI found in {api.upper()} record ID: {rec}")
-
-    if nr_total_invalid_dois > 0:
-        current_app.logger.warning(f"Total invalid DOIs found across all services: {nr_total_invalid_dois}")
-        raise TaskExecutionPartialError(f"Total invalid DOIs found across all services: {nr_total_invalid_dois}")
+    # Calculate the total number of invalid DOIs and DOI query errors across all record types
+    nr_total_invalid_dois = sum(record_types[record_type]["records_with_invalid_doi"] for record_type in record_types)
+    nr_total_doi_query_errors = sum(record_types[record_type]["records_with_doi_query_errors"] for record_type in record_types) 
+    if nr_total_invalid_dois + nr_total_doi_query_errors > 0:
+        raise TaskExecutionPartialError(f"Total invalid DOIs across all records: {nr_total_invalid_dois}\nTotal DOI query errors across all records: {nr_total_doi_query_errors}")
